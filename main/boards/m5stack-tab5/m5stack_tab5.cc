@@ -17,6 +17,7 @@
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <wifi_station.h>
+#include <esp_lvgl_port.h>
 #include "i2c_device.h"
 #include "esp_lcd_touch_gt911.h"
 #include <cstring>
@@ -31,6 +32,7 @@ LV_FONT_DECLARE(font_awesome_30_4);
 #define AUDIO_CODEC_ES8388_ADDR ES8388_CODEC_DEFAULT_ADDR
 #define LCD_MIPI_DSI_PHY_PWR_LDO_CHAN       3  // LDO_VO3 is connected to VDD_MIPI_DPHY
 #define LCD_MIPI_DSI_PHY_PWR_LDO_VOLTAGE_MV 2500
+#define I2C_MASTER_TIMEOUT_MS 50
 
 // PI4IO registers
 #define PI4IO_REG_CHIP_RESET 0x01
@@ -43,6 +45,9 @@ LV_FONT_DECLARE(font_awesome_30_4);
 #define PI4IO_REG_IN_STA     0x0F
 #define PI4IO_REG_INT_MASK   0x11
 #define PI4IO_REG_IRQ_STA    0x13
+
+#define setbit(x, y) x |= (0x01 << y)
+#define clrbit(x, y) x &= ~(0x01 << y)
 
 class Pi4ioe1 : public I2cDevice {
 public:
@@ -57,6 +62,41 @@ public:
         WriteReg(PI4IO_REG_IN_DEF_STA, 0b10000000);  // P1, P7 默认高电平
         WriteReg(PI4IO_REG_INT_MASK, 0b01111111);    // P7 中断使能 0 enable, 1 disable
         WriteReg(PI4IO_REG_OUT_SET, 0b01110110);     // Output Port Register P1(SPK_EN), P2(EXT5V_EN), P4(LCD_RST), P5(TP_RST), P6(CAM)RST 输出高电平
+    }
+    void ResetTouchPad()
+    {
+        ESP_LOGI(TAG, "reset tp");
+
+        // Reset INT pin settings and set it to OUTPUT mode
+        gpio_reset_pin(GPIO_NUM_23);
+        gpio_set_direction(GPIO_NUM_23, GPIO_MODE_OUTPUT);
+
+        // Read current output state
+        uint8_t write_buf[2] = {0};
+        uint8_t read_buf[1]  = {0};
+        write_buf[0] = PI4IO_REG_OUT_SET;
+        i2c_master_transmit_receive(i2c_device_, write_buf, 1, read_buf, 1, I2C_MASTER_TIMEOUT_MS);
+
+        // Set P4(LCD_RST) and P5(TP_RST) to HIGH, set Touch INT to LOW
+        write_buf[0] = PI4IO_REG_OUT_SET;
+        write_buf[1] = read_buf[0];
+        setbit(write_buf[1], 4);
+        setbit(write_buf[1], 5);
+        i2c_master_transmit(i2c_device_, write_buf, 2, I2C_MASTER_TIMEOUT_MS);
+        gpio_set_level(GPIO_NUM_23, 0);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+
+        // Set P4(LCD_RST) and P5(TP_RST) to HIGH, set Touch INT to HIGH
+        write_buf[0] = PI4IO_REG_OUT_SET;
+        write_buf[1] = read_buf[0];
+        setbit(write_buf[1], 4);
+        setbit(write_buf[1], 5);
+        i2c_master_transmit(i2c_device_, write_buf, 2, I2C_MASTER_TIMEOUT_MS);
+        gpio_set_level(GPIO_NUM_23, 1);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+
+        // Reset INT pin settings
+        gpio_reset_pin(GPIO_NUM_23);
     }
 };
 
@@ -76,6 +116,45 @@ public:
     }
 };
 
+class CustomLcdDisplay : public MipiLcdDisplay {
+public:
+    CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle,
+                    esp_lcd_panel_handle_t panel_handle,
+                    int width,
+                    int height,
+                    int offset_x,
+                    int offset_y,
+                    bool mirror_x,
+                    bool mirror_y,
+                    bool swap_xy)
+        : MipiLcdDisplay(io_handle, panel_handle,
+                    width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy,
+                    {
+                        .text_font = &font_puhui_30_4,
+                        .icon_font = &font_awesome_30_4,
+#if CONFIG_USE_WECHAT_MESSAGE_STYLE
+                        .emoji_font = font_emoji_32_init(),
+#else
+                        .emoji_font = font_emoji_64_init(),
+#endif
+                    }) {
+        DisplayLockGuard lock(this);
+        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES * 0.1, 0);
+        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES * 0.1, 0);
+        
+        lv_obj_t *btn = lv_btn_create(content_);
+        lv_obj_set_size(btn, 200, 80);
+        lv_obj_align(btn, LV_ALIGN_CENTER, 0, 0);
+        // 添加按钮点击事件
+        lv_obj_add_event_cb(btn, [](lv_event_t *e) {
+            printf("Button clicked!\n");
+        }, LV_EVENT_CLICKED, NULL);
+        // 设置文字
+        lv_obj_t *label = lv_label_create(btn);
+        lv_label_set_text(label, "Click Me");
+        lv_obj_center(label);
+    }
+};
  
 class M5StackTab5Board : public WifiBoard {
 private:
@@ -146,7 +225,11 @@ private:
 
     void InitializeGt911TouchPad() {
         ESP_LOGI(TAG, "Init GT911");
- 
+        if (pi4ioe1_) {
+            pi4ioe1_->ResetTouchPad();
+        } else {
+            ESP_LOGE(TAG, "pi4ioe2_ is null, cannot reset touch pad");
+        }
         /* Initialize Touch Panel */
         ESP_LOGI(TAG, "Initialize touch IO (I2C)");
         const esp_lcd_touch_config_t tp_cfg = {
@@ -170,16 +253,15 @@ private:
         tp_io_config.scl_speed_hz = 100000;
         esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle);
         esp_lcd_touch_new_i2c_gt911(tp_io_handle, &tp_cfg, &touch_);
+        esp_lcd_touch_exit_sleep(touch_); 
 
-        // 检测不到触摸？待更换设备测试
-        // /* read data test */ 
-        // for (uint8_t i = 0; i < 50; i++) {
-        //     esp_lcd_touch_read_data(touch_);
-        //     if (touch_->data.points > 0) {
-        //         printf("\ntouch: %d, %d\n", touch_->data.coords[0].x, touch_->data.coords[0].y);
-        //     }
-        //     vTaskDelay(pdMS_TO_TICKS(100));
-        // }
+        /* Add touch input (for selected screen) */
+        const lvgl_port_touch_cfg_t touch_cfg = {
+            .disp   = lv_display_get_default(),
+            .handle = touch_,
+        };
+
+        lvgl_port_add_touch(&touch_cfg);
     }
 
     void InitializeSpi() {
@@ -269,13 +351,15 @@ private:
         // ESP_ERROR_CHECK(esp_lcd_panel_mirror(disp_panel, false, true));
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 
-        display_ = new MipiLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X,
-                                      DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY,
-                                      {
-                                          .text_font  = &font_puhui_30_4,
-                                          .icon_font  = &font_awesome_30_4,
-                                          .emoji_font = font_emoji_64_init(),
-                                      });
+        display_ = new CustomLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X,
+                                      DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY
+                                    //   ,
+                                    //   {
+                                    //       .text_font  = &font_puhui_30_4,
+                                    //       .icon_font  = &font_awesome_30_4,
+                                    //       .emoji_font = font_emoji_64_init(),
+                                    //   }
+                                    );
     }
 
     // 物联网初始化，添加对 AI 可见设备
@@ -291,8 +375,8 @@ public:
         InitializeI2c();
         I2cDetect();
         InitializePi4ioe();
-        InitializeGt911TouchPad();
         InitializeIli9881cDisplay();
+        InitializeGt911TouchPad();
         InitializeButtons();
         InitializeIot();
         GetBacklight()->RestoreBrightness();
